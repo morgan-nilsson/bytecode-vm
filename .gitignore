@@ -1,0 +1,17 @@
+.DS_Store
+compile_commands.json
+.cache/
+*.o
+*.d
+*.dSYM/
+
+
+# Added by cargo
+
+/target
+
+
+/c_backup
+
+
+
