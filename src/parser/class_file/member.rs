@@ -125,6 +125,10 @@ impl<'a> Interfaces<'a> {
         }
         Ok(Interfaces(items))
     }
+
+    pub fn verify(&self, ctx: &ClassParseCtx) -> Result<(), ClassParserError> {
+        return Ok(());
+    }
 }
 
 /// A class's fields. No two may share both a name and a descriptor (JVMS 4.5).
@@ -149,6 +153,10 @@ impl<'a> Fields<'a> {
             items.push(field);
         }
         Ok(Fields(items))
+    }
+
+    pub fn verify(&self, ctx: &ClassParseCtx) -> Result<(), ClassParserError> {
+        return Ok(());
     }
 }
 
@@ -175,6 +183,10 @@ impl<'a> Methods<'a> {
             items.push(method);
         }
         Ok(Methods(items))
+    }
+
+    pub fn verify(&self, ctx: &ClassParseCtx) -> Result<(), ClassParserError> {
+        return Ok(());
     }
 }
 

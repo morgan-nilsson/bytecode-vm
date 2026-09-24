@@ -159,6 +159,10 @@ impl<'a> Attributes<'a> {
     pub fn into_vec(self) -> Vec<AttributeInfo<'a>> {
         self.0
     }
+
+    pub fn verify(&self, ctx: &ClassParseCtx) -> Result<(), ClassParserError> {
+        return Ok(());
+    }
 }
 
 impl<'a> std::ops::Deref for Attributes<'a> {

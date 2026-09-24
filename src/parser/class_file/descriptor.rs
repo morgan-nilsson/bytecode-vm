@@ -53,3 +53,28 @@ pub fn valid_segment(seg: JavaUTF8) -> bool {
     !seg.is_empty()                              // rejects "a//b" too
         && !seg.as_bytes().iter().any(|&b| matches!(b, b'.' | b';' | b'[' | b'/'))
 }
+
+pub fn valid_method_descriptor(descriptor: JavaUTF8) -> bool {
+    let d = descriptor.as_bytes();
+    if d.first() != Some(&b'(') {
+        return false;
+    }
+    let mut tail = &d[1..];
+    while let Some(t) = field_descriptor_tail(tail, 0) {
+        tail = t;
+    }
+    if tail.first() != Some(&b')') {
+        return false;
+    }
+    let ret = &tail[1..];
+    ret == b"V" || field_descriptor_tail(ret, 0) == Some(&[][..])
+}
+
+/// An unqualified name (JVMS 4.2.2): a member's own name, not a descriptor and
+/// not a qualified class name. Must be non-empty and must not contain any of
+/// `. ; [ /`. A method name additionally may not contain `<` or `>` unless it
+/// is exactly `<init>` or `<clinit>`, which `valid_method_name` covers.
+pub fn valid_unqualified_name(name: JavaUTF8) -> bool {
+    !name.is_empty()
+        && !name.as_bytes().iter().any(|&b| matches!(b, b'.' | b';' | b'[' | b'/'))
+}

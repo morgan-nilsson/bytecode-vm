@@ -68,6 +68,46 @@ bitflags! {
     }
 }
 
+impl ClassFileAccessFlags {
+    pub fn verify(&self, ctx: &ClassParseCtx) -> Result<(), ClassParserError> {
+        
+        if ctx.access_flags.contains(ClassFileAccessFlags::ANNOTATION) && !ctx.access_flags.contains(ClassFileAccessFlags::INTERFACE) {
+            return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
+        }
+
+        if ctx.access_flags.contains(ClassFileAccessFlags::FINAL) && ctx.access_flags.contains(ClassFileAccessFlags::ABSTRACT) {
+            return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
+        }
+
+        if ctx.access_flags.contains(ClassFileAccessFlags::INTERFACE) && !ctx.access_flags.contains(ClassFileAccessFlags::ABSTRACT) {
+            return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
+        }
+
+        if ctx.access_flags.contains(ClassFileAccessFlags::MODULE) {
+            if ctx.access_flags.contains(ClassFileAccessFlags::FINAL)
+                || ctx.access_flags.contains(ClassFileAccessFlags::SUPER)
+                || ctx.access_flags.contains(ClassFileAccessFlags::INTERFACE)
+                || ctx.access_flags.contains(ClassFileAccessFlags::ABSTRACT)
+                || ctx.access_flags.contains(ClassFileAccessFlags::ANNOTATION)
+                || ctx.access_flags.contains(ClassFileAccessFlags::ENUM)
+            {
+                return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
+            }
+        }
+
+        if ctx.access_flags.contains(ClassFileAccessFlags::INTERFACE) {
+            if ctx.access_flags.contains(ClassFileAccessFlags::ENUM)
+                || ctx.access_flags.contains(ClassFileAccessFlags::FINAL)
+                || ctx.access_flags.contains(ClassFileAccessFlags::SUPER)
+            {
+                return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
+            }
+        }
+
+        return Ok(());
+    }
+}
+
 /// What the sub-parsers need to know about the class file around them: the
 /// version that gates which features are legal, and the pool and header fields
 /// that indices resolve against. Borrows from the same buffer the class does.
@@ -78,6 +118,10 @@ pub struct ClassParseCtx<'a> {
     pub access_flags: ClassFileAccessFlags,
     pub this_class: JavaUTF8<'a>,
     pub super_class: Option<JavaUTF8<'a>>,
+    pub interfaces: Option<Interfaces<'a>>,
+    pub fields: Option<Fields<'a>>,
+    pub methods: Option<Methods<'a>>,
+    pub attributes: Option<Attributes<'a>>,
 }
 
 impl<'a> ClassParseCtx<'a> {
@@ -96,7 +140,31 @@ impl<'a> ClassParseCtx<'a> {
             access_flags,
             this_class,
             super_class,
+            interfaces: None,
+            fields: None,
+            methods: None,
+            attributes: None,
         }
+    }
+
+    fn with_interfaces(mut self, interfaces: Interfaces<'a>) -> Self {
+        self.interfaces = Some(interfaces);
+        self
+    }
+
+    fn with_fields(mut self, fields: Fields<'a>) -> Self {
+        self.fields = Some(fields);
+        self
+    }
+
+    fn with_methods(mut self, methods: Methods<'a>) -> Self {
+        self.methods = Some(methods);
+        self
+    }
+
+    fn with_attributes(mut self, attributes: Attributes<'a>) -> Self {
+        self.attributes = Some(attributes);
+        self
     }
 
     fn at_least(&self, major: u16) -> bool {
@@ -210,63 +278,43 @@ impl<'a> ClassFile<'a> {
 
         // Everything the context carries is now known, so members and
         // attributes can resolve against the real pool.
-        let parser_ctx = ClassParseCtx::new(
+        let mut parser_ctx = ClassParseCtx::new(
             major_version,
             minor_version,
-            constant_pool,
+            constant_pool.clone(),
             access_flags,
             this_class_name,
             super_class,
         );
+        parser_ctx = parser_ctx.with_interfaces(interfaces.clone());
 
         let fields = Fields::parse(reader, &parser_ctx)?;
+        parser_ctx = parser_ctx.with_fields(fields.clone());
+
         let methods = Methods::parse(reader, &parser_ctx)?;
+        parser_ctx = parser_ctx.with_methods(methods.clone());
 
         let attributes = Attributes::parse(reader, &parser_ctx, AttributeLocation::ClassFile)?;
+        parser_ctx = parser_ctx.with_attributes(attributes.clone());
 
         // if reader still has bytes left, return an error
         if !reader.is_empty() {
             return Err(ClassParserError::ClassParseTrailingBytes);
         }
 
-        // Verify access flags
-        if access_flags.contains(ClassFileAccessFlags::ANNOTATION) && !access_flags.contains(ClassFileAccessFlags::INTERFACE) {
-            return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
-        }
-
-        if access_flags.contains(ClassFileAccessFlags::FINAL) && access_flags.contains(ClassFileAccessFlags::ABSTRACT) {
-            return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
-        }
-
-        if access_flags.contains(ClassFileAccessFlags::INTERFACE) && !access_flags.contains(ClassFileAccessFlags::ABSTRACT) {
-            return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
-        }
-
-        if access_flags.contains(ClassFileAccessFlags::MODULE) {
-            if access_flags.contains(ClassFileAccessFlags::FINAL)
-                || access_flags.contains(ClassFileAccessFlags::SUPER)
-                || access_flags.contains(ClassFileAccessFlags::INTERFACE)
-                || access_flags.contains(ClassFileAccessFlags::ABSTRACT)
-                || access_flags.contains(ClassFileAccessFlags::ANNOTATION)
-                || access_flags.contains(ClassFileAccessFlags::ENUM)
-            {
-                return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
-            }
-        }
-
-        if access_flags.contains(ClassFileAccessFlags::INTERFACE) {
-            if access_flags.contains(ClassFileAccessFlags::ENUM)
-                || access_flags.contains(ClassFileAccessFlags::FINAL)
-                || access_flags.contains(ClassFileAccessFlags::SUPER)
-            {
-                return Err(ClassParserError::ClassParseInvalidAccessFlagsCombination);
-            }
-        }
+        // Nothing to do for major and minor version
+        constant_pool.verify(&parser_ctx)?;
+        access_flags.verify(&parser_ctx)?;
+        // Nothing to do for this_class and super_class
+        interfaces.verify(&parser_ctx)?;
+        fields.verify(&parser_ctx)?;
+        methods.verify(&parser_ctx)?;
+        attributes.verify(&parser_ctx)?;
 
         return Ok(Self {
             minor_version,
             major_version,
-            constant_pool: parser_ctx.pool,
+            constant_pool,
             access_flags,
             this_class: this_class_name,
             super_class,

@@ -1,9 +1,10 @@
 use crate::parser::reader::Reader;
 use crate::parser::class_file::ClassParseCtx;
 use crate::java_utf::{ JavaUTF8, JavaUTF8Error };
+use crate::parser::class_file::ClassFileAccessFlags;
 
 use super::error::ClassParserError;
-use super::descriptor::valid_class_entry_name;
+use super::descriptor::{valid_unqualified_name, valid_class_entry_name, valid_field_descriptor, valid_method_descriptor};
 
 /// The constant pool, indexed from 1 (JVMS 4.4). Dereferences to a slice, so
 /// `len()` and iteration work; `get` applies the 1-based indexing and refuses
@@ -37,13 +38,12 @@ impl<'a> ConstantPool<'a> {
             return Err(ClassParserError::ClassParseInvalidConstantPool);
         }
         let pool = ConstantPool { entries };
-        pool.validate_references()?;
         Ok(pool)
     }
 
     /// Checks every entry's references. This cannot happen while reading,
     /// because an entry may name one that appears later in the table
-    pub fn validate_references(&self) -> Result<(), ClassParserError> {
+    pub fn verify(&self, ctx: &ClassParseCtx) -> Result<(), ClassParserError> {
         for entry in &self.entries {
             match entry {
                 ConstantPoolEntry::ClassIndex(n) => {
@@ -53,37 +53,170 @@ impl<'a> ConstantPool<'a> {
                     }
                 }
 
-                // Each of these names a Utf8 as its only reference.
-                ConstantPoolEntry::StringIndex(n)
-                | ConstantPoolEntry::MethodTypeIndex(n)
-                | ConstantPoolEntry::ModuleIndex(n)
-                | ConstantPoolEntry::PackageIndex(n) => {
+                ConstantPoolEntry::StringIndex(n) => {
                     self.utf8(*n)?;
                 }
 
+                // Each of these names a Utf8 as its only reference.
+                ConstantPoolEntry::ModuleIndex(n)
+                | ConstantPoolEntry::PackageIndex(n) => {
+                    if !ctx.at_least(53) {
+                        return Err(ClassParserError::ClassParseInvalidFeatureUsedForVersion);
+                    }
+                    self.utf8(*n)?;
+                    if !ctx.access_flags.contains(ClassFileAccessFlags::MODULE) {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+                }
+
+                ConstantPoolEntry::MethodTypeIndex(n) => {
+                    if !ctx.at_least(51) {
+                        return Err(ClassParserError::ClassParseInvalidFeatureUsedForVersion);
+                    }
+                    let index = self.utf8(*n)?;
+                    if !valid_method_descriptor(index) {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+                }
+
                 ConstantPoolEntry::NameAndType { name_index, descriptor_index } => {
-                    self.utf8(*name_index)?;
-                    self.utf8(*descriptor_index)?;
+                    let name = self.utf8(*name_index)?;
+                    let desc = self.utf8(*descriptor_index)?;
+                    if !valid_unqualified_name(name) {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+                    if !valid_field_descriptor(desc) && !valid_method_descriptor(desc) {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
                 }
 
-                ConstantPoolEntry::FieldRef { class_index, name_and_type_index }
-                | ConstantPoolEntry::MethodRef { class_index, name_and_type_index }
-                | ConstantPoolEntry::InterfaceMethodRef { class_index, name_and_type_index } => {
+                ConstantPoolEntry::FieldRef { class_index, name_and_type_index } => {
                     self.class_name(*class_index)?;
-                    self.name_and_type(*name_and_type_index)?;
+                    let nat = self.name_and_type(*name_and_type_index)?;   // → (name_index, descriptor_index)
+                    let name = self.utf8(nat.0)?;
+                    let desc = self.utf8(nat.1)?;
+                    if !valid_unqualified_name(name) || !valid_field_descriptor(desc) {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+
                 }
 
-                // bootstrap_index indexes the BootstrapMethods attribute rather
-                // than the pool, so it is checked once that attribute is read.
-                ConstantPoolEntry::Dynamic { name_and_type_index, .. }
-                | ConstantPoolEntry::InvokeDynamic { name_and_type_index, .. } => {
-                    self.name_and_type(*name_and_type_index)?;
+                ConstantPoolEntry::MethodRef { class_index, name_and_type_index }
+                | ConstantPoolEntry::InterfaceMethodRef { class_index, name_and_type_index } => {
+                    let is_interface = matches!(entry, ConstantPoolEntry::InterfaceMethodRef { .. });
+                    self.class_name(*class_index)?;
+                    let nat = self.name_and_type(*name_and_type_index)?;
+                    let name = self.utf8(nat.0)?;
+                    let desc = self.utf8(nat.1)?;
+
+                    if !valid_method_descriptor(desc) {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+
+                    let n = name.as_bytes();
+                    if n.first() == Some(&b'<') {
+                        // Only <init>, only on Methodref, and it must return void.
+                        if is_interface || n != b"<init>" || !desc.as_bytes().ends_with(b")V") {
+                            return Err(ClassParserError::ClassParseFormatError);
+                        }
+                    } else if !valid_unqualified_name(name) || n.contains(&b'>') {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+                }
+
+                // JVMS 4.4.10 constrains the *descriptor* of the NameAndType:
+                // a field descriptor for Dynamic, a method descriptor for
+                // InvokeDynamic. The name is an ordinary member name.
+                ConstantPoolEntry::Dynamic { name_and_type_index, .. } => {
+                    let (name_index, descriptor_index) =
+                        self.name_and_type(*name_and_type_index)?;
+                    if !valid_unqualified_name(self.utf8(name_index)?)
+                        || !valid_field_descriptor(self.utf8(descriptor_index)?) {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+
+                    // There must be a bootstrap 
+                    if !ctx.attributes.as_ref().unwrap().iter().any(|attr| matches!(attr, super::attribute::AttributeInfo::BootstrapMethods { .. })) {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+
+                }
+
+                ConstantPoolEntry::InvokeDynamic { bootstrap_index, name_and_type_index} => {
+                    let (name_index, descriptor_index) =
+                        self.name_and_type(*name_and_type_index)?;
+                    if !valid_unqualified_name(self.utf8(name_index)?)
+                        || !valid_method_descriptor(self.utf8(descriptor_index)?) {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+
+                    // bootstrap_index must be in range of the BootstrapMethods attribute
+                    let bootstrap_methods = ctx.attributes
+                            .as_ref()
+                            .ok_or(ClassParserError::ClassParseFormatError)?
+                            .iter()
+                            .find_map(|attr| {
+                        if let super::attribute::AttributeInfo::BootstrapMethods { value } = attr {
+                            Some(value)
+                        } else {
+                            None
+                        }
+                    }).ok_or(ClassParserError::ClassParseFormatError)?;
+
+                    if usize::from(*bootstrap_index) >= bootstrap_methods.len() {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
                 }
 
                 // Which kind the reference must be depends on ref_kind, so only
                 // its existence is settled here (JVMS 4.4.8 has the rest).
-                ConstantPoolEntry::MethodHandle { ref_index, .. } => {
-                    self.require(*ref_index)?;
+                ConstantPoolEntry::MethodHandle { ref_kind, ref_index } => {
+                    let target = self.member_ref(*ref_index)?;
+                    if *ref_kind == MethodHandleKind::InvokeStatic || *ref_kind == MethodHandleKind::InvokeSpecial {
+                        if matches!(target, ConstantPoolEntry::InterfaceMethodRef { .. }) {
+                            if !ctx.at_least(52) {
+                                return Err(ClassParserError::ClassParseInvalidFeatureUsedForVersion);
+                            }
+                        }
+                    }
+
+                    let ok_tag = match (ref_kind, target) {
+                        (MethodHandleKind::GetField, ConstantPoolEntry::FieldRef { .. }) => true,
+                        (MethodHandleKind::GetStatic, ConstantPoolEntry::FieldRef { .. }) => true,
+                        (MethodHandleKind::PutField, ConstantPoolEntry::FieldRef { .. }) => true,
+                        (MethodHandleKind::PutStatic, ConstantPoolEntry::FieldRef { .. }) => true,
+                        (MethodHandleKind::InvokeVirtual, ConstantPoolEntry::MethodRef { .. }) => true,
+                        (MethodHandleKind::InvokeStatic, ConstantPoolEntry::MethodRef { .. }) => true,
+                        (MethodHandleKind::InvokeSpecial, ConstantPoolEntry::MethodRef { .. }) => true,
+                        (MethodHandleKind::NewInvokeSpecial, ConstantPoolEntry::MethodRef { .. }) => true,
+                        (MethodHandleKind::InvokeInterface, ConstantPoolEntry::InterfaceMethodRef { .. }) => true,
+                        (MethodHandleKind::InvokeStatic, ConstantPoolEntry::InterfaceMethodRef { .. }) => true,
+                        (MethodHandleKind::InvokeSpecial, ConstantPoolEntry::InterfaceMethodRef { .. }) => true,
+                        _ => false
+                    };
+                    if !ok_tag {
+                        return Err(ClassParserError::ClassParseFormatError);
+                    }
+
+                    let bad_name = match ref_kind {
+                        MethodHandleKind::InvokeVirtual
+                        | MethodHandleKind::InvokeStatic
+                        | MethodHandleKind::InvokeSpecial
+                        | MethodHandleKind::InvokeInterface => {
+                            let n = self.member_ref_name(*ref_index)?;
+                            n == "<init>" || n == "<clinit>"
+                        }
+                        MethodHandleKind::NewInvokeSpecial => {
+                            self.member_ref_name(*ref_index)? != "<init>"
+                        }
+                        _ => false,
+                    };
+                    {
+                        if bad_name {
+                            return Err(ClassParserError::ClassParseFormatError);
+                        }
+
+                    }
                 }
 
                 ConstantPoolEntry::UTF8(_)
@@ -96,6 +229,34 @@ impl<'a> ConstantPool<'a> {
         }
         Ok(())
     }
+
+    /// The member reference at `index` — Fieldref, Methodref or
+    /// InterfaceMethodref. Which of the three a caller requires is its own
+    /// rule; naming something that is no member reference at all is a bad
+    /// reference rather than a format error.
+    pub fn member_ref(&self, index: u16) -> Result<&ConstantPoolEntry<'a>, ClassParserError> {
+        match self.require(index)? {
+            entry @ (ConstantPoolEntry::FieldRef { .. }
+            | ConstantPoolEntry::MethodRef { .. }
+            | ConstantPoolEntry::InterfaceMethodRef { .. }) => Ok(entry),
+            _ => Err(ClassParserError::ClassParseReferenceToInvalidConstantPoolEntry),
+        }
+    }
+
+    /// The name the member reference at `index` points at.
+    pub fn member_ref_name(&self, index: u16) -> Result<JavaUTF8<'a>, ClassParserError> {
+        let nat_index = match self.member_ref(index)? {
+            ConstantPoolEntry::FieldRef { name_and_type_index, .. }
+            | ConstantPoolEntry::MethodRef { name_and_type_index, .. }
+            | ConstantPoolEntry::InterfaceMethodRef { name_and_type_index, .. } => {
+                *name_and_type_index
+            }
+            _ => unreachable!("member_ref only returns the three member reference kinds"),
+        };
+        let (name_index, _descriptor_index) = self.name_and_type(nat_index)?;
+        self.utf8(name_index)
+    }
+
 
     /// The CONSTANT_NameAndType at `index`, checked for kind.
     pub fn name_and_type(&self, index: u16) -> Result<(u16, u16), ClassParserError> {
@@ -280,8 +441,6 @@ impl<'a> ConstantPoolEntry<'a> {
                 }
                 let bootstrap_index = reader.u16()?;
                 let name_and_type_index = reader.u16()?;
-                // The referent is checked by validate_references, once the pool
-                // is whole — it may appear after this entry.
                 return Ok(ConstantPoolEntry::Dynamic { bootstrap_index, name_and_type_index });
             },
             18 => {
